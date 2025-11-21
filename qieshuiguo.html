@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 手势切水果</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            /* 1. 背景改为纯黑色 */
+            background-color: #000000;
+            overflow: hidden;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        canvas {
+            position: absolute;
+            left: 0;
+            top: 0;
+            z-index: 2;
+        }
+
+        .input_video {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: -1;
+            opacity: 0; 
+            width: 1px;
+            height: 1px;
+        }
+
+        #ui-layer {
+            position: absolute;
+            z-index: 10;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .hud-top {
+            display: flex;
+            justify-content: space-between;
+            padding: 20px 40px;
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
+        }
+
+        .score-box { color: #ffcc00; }
+        .timer-box { color: #ff4444; }
+
+        #overlay {
+            position: absolute;
+            z-index: 20;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9); /* 背景更黑 */
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            pointer-events: auto;
+            transition: opacity 0.3s;
+        }
+
+        h1 {
+            font-size: 4rem;
+            margin: 0 0 20px 0;
+            background: linear-gradient(45deg, #ff00cc, #3333ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 0 0 20px rgba(255, 255, 255, 0.2);
+        }
+
+        p { font-size: 1.2rem; color: #ccc; max-width: 600px; text-align: center; margin-bottom: 30px;}
+
+        .gesture-hint {
+            font-size: 1.5rem;
+            color: #00ffcc;
+            border: 2px solid #00ffcc;
+            padding: 15px 30px;
+            border-radius: 50px;
+            animation: pulse 2s infinite;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(0, 255, 204, 0.4); }
+            70% { box-shadow: 0 0 0 20px rgba(0, 255, 204, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(0, 255, 204, 0); }
+        }
+
+        #loading-text {
+            margin-top: 20px;
+            color: #888;
+            font-size: 0.9rem;
+        }
+
+        .hidden { opacity: 0; pointer-events: none; }
+    </style>
+</head>
+<body>
+
+    <div id="container">
+        <video class="input_video" playsinline></video>
+        <canvas id="gameCanvas"></canvas>
+
+        <div id="ui-layer">
+            <div class="hud-top">
+                <div class="score-box">分数: <span id="score">0</span></div>
+                <div class="timer-box">时间: <span id="timer">60</span>s</div>
+            </div>
+        </div>
+
+        <div id="overlay">
+            <h1>AI 手势切水果</h1>
+            <p>屏幕顶部将有水果落下。食指控制<b>水果刀</b>。<br>背景纯黑，专注于切割。</p>
+            
+            <!-- 4. 开启界面提示 -->
+            <div id="start-area" class="gesture-hint" style="display:none">
+                <span>✌️</span> 对着摄像头做出“剪刀手”开始
+            </div>
+
+            <div id="loading-text">正在初始化 AI 模型...</div>
+        </div>
+    </div>
+
+    <script>
+        const config = {
+            gameDuration: 60,
+            fruitSpawnRate: 800,
+            gravity: 0.2, // 稍微增加重力感
+            cursorTrailLength: 8,
+            requiredSliceSpeed: 5 
+        };
+
+        const state = {
+            isPlaying: false,
+            score: 0,
+            timeLeft: config.gameDuration,
+            fruits: [],
+            particles: [],
+            scorePopups: [], // 新增：存储分数的浮动动画
+            handPos: { x: -100, y: -100 },
+            prevHandPos: { x: -100, y: -100 },
+            trail: [], 
+            lastSpawnTime: 0,
+            gestureStartCount: 0, // 用于手势防抖
+            landmarks: null // 存储手部关键点用于手势识别
+        };
+
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const videoElement = document.getElementsByClassName('input_video')[0];
+        const overlay = document.getElementById('overlay');
+        const startArea = document.getElementById('start-area');
+        const scoreEl = document.getElementById('score');
+        const timerEl = document.getElementById('timer');
+        const loadingText = document.getElementById('loading-text');
+        const titleEl = document.querySelector('#overlay h1');
+        const pEl = document.querySelector('#overlay p');
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        const FRUIT_TYPES = ['🍎', '🍌', '🍉', '🍇', '🍊', '🍍', '🥝', '🥥'];
+        
+        // 新增：分数弹出类
+        class ScorePopup {
+            constructor(x, y, text) {
+                this.x = x;
+                this.y = y;
+                this.text = text;
+                this.life = 1.0;
+                this.vy = -3; // 向上飘
+                this.scale = 1.0;
+            }
+
+            update() {
+                this.y += this.vy;
+                this.life -= 0.02;
+                this.scale += 0.01; // 稍微变大
+            }
+
+            draw(ctx) {
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.scale(this.scale, this.scale);
+                ctx.globalAlpha = Math.max(0, this.life);
+                
+                ctx.font = "bold 50px Arial";
+                ctx.fillStyle = "#ffcc00";
+                ctx.shadowColor = "rgba(255, 204, 0, 0.5)";
+                ctx.shadowBlur = 10;
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(this.text, 0, 0);
+                
+                // 描边让文字更清晰
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = "white";
+                ctx.strokeText(this.text, 0, 0);
+                
+                ctx.restore();
+            }
+        }
+
+        class Fruit {
+            constructor() {
+                this.emoji = FRUIT_TYPES[Math.floor(Math.random() * FRUIT_TYPES.length)];
+                this.radius = 65; // 显著增大碰撞判定半径 (原35)
+                
+                // 2. 水果从底部生成
+                this.x = Math.random() * (canvas.width - 100) + 50;
+                this.y = canvas.height + 50; 
+                
+                // 2. 物理计算：最高点接近窗口 85% 高度
+                // 目标高度 Y (屏幕顶端是0，所以目标是 height * 0.15)
+                const targetY = canvas.height * 0.15 + (Math.random() * canvas.height * 0.1); // 15%-25% 之间浮动
+                const h = this.y - targetY; // 上升高度
+                
+                // v^2 = 2gh => v = sqrt(2gh)
+                // 向上速度为负值
+                this.vy = -Math.sqrt(2 * config.gravity * h);
+                
+                // 水平速度：向屏幕中心稍微聚拢
+                const centerX = canvas.width / 2;
+                const distToCenter = centerX - this.x;
+                // 飞行时间 t = vy / g
+                const timeToApex = Math.abs(this.vy) / config.gravity;
+                // 简单的水平位移逻辑，让它在到达最高点附近时稍微靠近中心或穿过中心
+                this.vx = (distToCenter / timeToApex) * (0.5 + Math.random() * 0.5); // 随机系数
+
+                this.rotation = 0;
+                this.rotationSpeed = (Math.random() - 0.5) * 0.15;
+                this.active = true;
+            }
+
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.vy += config.gravity;
+                this.rotation += this.rotationSpeed;
+
+                // 边界检查
+                if (this.y > canvas.height + 100) {
+                    this.active = false;
+                }
+            }
+
+            draw(ctx) {
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.rotate(this.rotation);
+                ctx.font = "120px Arial"; // 显著增大水果显示大小 (原60px)
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(this.emoji, 0, 10); // 微调垂直对齐
+                ctx.restore();
+            }
+        }
+
+        class Particle {
+            constructor(x, y, color) {
+                this.x = x;
+                this.y = y;
+                this.vx = (Math.random() - 0.5) * 15;
+                this.vy = (Math.random() - 0.5) * 15;
+                this.life = 1.0;
+                this.color = color;
+                this.size = Math.random() * 5 + 2;
+            }
+
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.vy += config.gravity;
+                this.life -= 0.03;
+            }
+
+            draw(ctx) {
+                ctx.globalAlpha = Math.max(0, this.life);
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.globalAlpha = 1.0;
+            }
+        }
+
+        function renderLoop() {
+            // 1. 清空画布 (背景已经是纯黑 CSS)
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 注意：这里不再绘制 videoElement，实现“背景纯黑色”的需求
+            
+            // 检测手势启动 (仅在非游戏状态)
+            if (!state.isPlaying && state.landmarks) {
+                detectStartGesture(state.landmarks);
+            }
+
+            // 游戏逻辑
+            if (state.isPlaying) {
+                updateGameLogic();
+            } else {
+                // 非游戏状态也画光标，方便用户知道手在哪
+                drawCursor();
+            }
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        // 4. 手势检测逻辑：剪刀手 (Index & Middle Extended, others curled)
+        function detectStartGesture(landmarks) {
+            // 简单的判断：食指指尖(8)高于关节(6)，中指指尖(12)高于关节(10)
+            // 且 无名指(16)低于关节(14)，小指(20)低于关节(18)
+            // 注意：Y轴向下为正，所以"高"意味着 y 值更小
+            
+            const indexUp = landmarks[8].y < landmarks[6].y;
+            const middleUp = landmarks[12].y < landmarks[10].y;
+            const ringDown = landmarks[16].y > landmarks[14].y;
+            const pinkyDown = landmarks[20].y > landmarks[18].y;
+
+            if (indexUp && middleUp && ringDown && pinkyDown) {
+                state.gestureStartCount++;
+                // 增加视觉反馈
+                startArea.style.background = `rgba(0, 255, 204, ${Math.min(1, state.gestureStartCount / 20)})`;
+                startArea.style.color = '#000';
+                
+                if (state.gestureStartCount > 20) { // 保持约 0.5 秒
+                    startGame();
+                    state.gestureStartCount = 0;
+                }
+            } else {
+                state.gestureStartCount = 0;
+                startArea.style.background = 'transparent';
+                startArea.style.color = '#00ffcc';
+            }
+        }
+
+        function updateGameLogic() {
+            // 更新轨迹
+            state.trail.push({ x: state.handPos.x, y: state.handPos.y });
+            if (state.trail.length > config.cursorTrailLength) state.trail.shift();
+
+            const now = Date.now();
+            if (now - state.lastSpawnTime > config.fruitSpawnRate) {
+                state.fruits.push(new Fruit());
+                state.lastSpawnTime = now;
+                if (config.fruitSpawnRate > 300) config.fruitSpawnRate -= 2;
+            }
+
+            for (let i = state.fruits.length - 1; i >= 0; i--) {
+                const f = state.fruits[i];
+                f.update();
+
+                const dx = state.handPos.x - state.prevHandPos.x;
+                const dy = state.handPos.y - state.prevHandPos.y;
+                const handSpeed = Math.hypot(dx, dy);
+                const dist = Math.hypot(f.x - state.handPos.x, f.y - state.handPos.y);
+
+                if (f.active && dist < f.radius + 40 && handSpeed > config.requiredSliceSpeed) {
+                    f.active = false;
+                    const points = 10;
+                    state.score += points;
+                    scoreEl.innerText = state.score;
+                    
+                    // 触发特效
+                    createExplosion(f.x, f.y);
+                    // 新增：添加浮动分数
+                    state.scorePopups.push(new ScorePopup(f.x, f.y, "+" + points));
+                    
+                    state.fruits.splice(i, 1);
+                } else if (!f.active) {
+                    state.fruits.splice(i, 1);
+                }
+            }
+
+            // 更新粒子
+            for (let i = state.particles.length - 1; i >= 0; i--) {
+                const p = state.particles[i];
+                p.update();
+                if (p.life <= 0) state.particles.splice(i, 1);
+            }
+            
+            // 新增：更新浮动分数
+            for (let i = state.scorePopups.length - 1; i >= 0; i--) {
+                const popup = state.scorePopups[i];
+                popup.update();
+                if (popup.life <= 0) state.scorePopups.splice(i, 1);
+            }
+
+            drawGameElements();
+        }
+
+        function drawGameElements() {
+            state.fruits.forEach(f => f.draw(ctx));
+            state.particles.forEach(p => p.draw(ctx));
+            // 新增：绘制浮动分数
+            state.scorePopups.forEach(popup => popup.draw(ctx));
+
+            if (state.trail.length > 1) {
+                ctx.beginPath();
+                ctx.moveTo(state.trail[0].x, state.trail[0].y);
+                for (let i = 1; i < state.trail.length; i++) {
+                    const p0 = state.trail[i-1];
+                    const p1 = state.trail[i];
+                    ctx.quadraticCurveTo(p0.x, p0.y, (p0.x + p1.x)/2, (p0.y + p1.y)/2);
+                }
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.lineWidth = 6;
+                ctx.strokeStyle = '#ffffff';
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = '#00ffcc';
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+            }
+            
+            // 绘制刀
+            drawCursor();
+        }
+
+        function drawCursor() {
+            // 3. 设置虚拟光标为可爱水果刀
+            const { x, y } = state.handPos;
+            const { x: px, y: py } = state.prevHandPos;
+            
+            // 计算移动角度，让刀头指向移动方向
+            let angle = Math.atan2(y - py, x - px);
+            // 如果移动很慢，保持默认角度 (-45度，朝左上)
+            if (Math.abs(x - px) < 1 && Math.abs(y - py) < 1) {
+                angle = -Math.PI / 4; 
+            } else {
+                // 刀尖通常与Emoji方向有关，'🔪' 默认朝左下。
+                // 我们加个偏移量让它看起来顺手
+                angle += Math.PI * 0.75;
+            }
+
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(angle);
+            ctx.font = "80px Arial"; // 稍微加大刀的大小 (原40px)
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText("🔪", 0, 0);
+            ctx.restore();
+        }
+
+        function createExplosion(x, y) {
+            for (let i = 0; i < 15; i++) {
+                const colors = ['#FFF', '#ffeb3b', '#ff5722'];
+                state.particles.push(new Particle(x, y, colors[Math.floor(Math.random()*colors.length)]));
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults((results) => {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const landmarks = results.multiHandLandmarks[0];
+                state.landmarks = landmarks; // 保存用于手势识别
+
+                const indexTip = landmarks[8];
+                const x = (1 - indexTip.x) * canvas.width;
+                const y = indexTip.y * canvas.height;
+
+                state.prevHandPos = { ...state.handPos };
+                state.handPos = { x, y };
+            } else {
+                state.landmarks = null;
+            }
+        });
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+
+        function startGame() {
+            if (state.isPlaying) return;
+            state.isPlaying = true;
+            state.score = 0;
+            state.timeLeft = config.gameDuration;
+            state.fruits = [];
+            state.particles = [];
+            state.scorePopups = []; // 重置分数弹窗
+            state.lastSpawnTime = Date.now();
+            config.fruitSpawnRate = 800;
+            
+            scoreEl.innerText = "0";
+            timerEl.innerText = state.timeLeft;
+            overlay.classList.add('hidden');
+            
+            const timerInterval = setInterval(() => {
+                state.timeLeft--;
+                timerEl.innerText = state.timeLeft;
+                if (state.timeLeft <= 0) {
+                    clearInterval(timerInterval);
+                    endGame();
+                }
+            }, 1000);
+        }
+
+        function endGame() {
+            state.isPlaying = false;
+            overlay.classList.remove('hidden');
+            titleEl.innerText = "时间到!";
+            pEl.innerHTML = `最终得分: <span style="color:#ffcc00; font-size:1.5em">${state.score}</span>`;
+            startArea.style.background = 'transparent'; // 重置手势按钮样式
+        }
+
+        camera.start()
+            .then(() => {
+                console.log("Camera init success");
+                loadingText.style.display = 'none';
+                startArea.style.display = 'flex'; // 显示手势提示
+                requestAnimationFrame(renderLoop);
+            })
+            .catch(err => {
+                loadingText.innerText = "无法访问摄像头，请检查权限。";
+                loadingText.style.color = "red";
+            });
+
+    </script>
+</body>
+</html>
